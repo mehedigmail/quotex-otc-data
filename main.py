@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Quotex OTC Data Server",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -15,19 +15,21 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_headers=["GET"],
 )
 
+
 @app.get("/")
-def home():
+async def home():
     return {
         "status": "ok",
-        "message": "Quotex OTC Data Server is running"
+        "message": "Quotex OTC Data Server is running",
+        "version": "2.1.0"
     }
 
 
 @app.get("/api/health")
-def health():
+async def health():
     return {
         "status": "ok",
         "server": "running",
@@ -38,8 +40,8 @@ def health():
             os.getenv("QUOTEX_EMAIL")
             and os.getenv("QUOTEX_PASSWORD")
         ),
-        "tradingEnabled": False,
-        "accountMode": "DEMO"
+        "accountMode": "DEMO",
+        "tradingEnabled": False
     }
 
 
@@ -52,8 +54,10 @@ async def test_otc_connection():
     if not email or not password:
         raise HTTPException(
             status_code=400,
-            detail="Quotex credentials are not configured"
+            detail="Credentials are not configured"
         )
+
+    client = None
 
     try:
         from pyquotex.stable_api import Quotex
@@ -61,49 +65,78 @@ async def test_otc_connection():
         client = Quotex(
             email=email,
             password=password,
-            lang="en"
+            lang="en",
+            asset_default="EURUSD",
+            period_default=60
         )
 
         # DEMO MODE ONLY
         client.account_is_demo = 1
 
-        try:
-            connected, message = await client.connect()
+        connected, message = await client.connect()
 
-            if not connected:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Connection failed: {message}"
-                )
-
-            assets = await client.get_instruments()
-
-            asset, asset_status = await client.get_available_asset(
-                "EURUSD",
-                force_open=True
+        if not connected:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Quotex connection failed: {message}"
             )
 
-            candles = await client.get_candles(
-                asset,
-                time.time(),
-                3600,
-                60
+        # Get available assets
+        assets = await client.get_all_assets()
+
+        if not assets:
+            raise HTTPException(
+                status_code=502,
+                detail="No assets received from Quotex"
             )
+
+        # Find EUR/USD OTC
+        otc_asset = next(
+            (
+                name for name in assets.keys()
+                if "eurusd" in name.lower()
+                and "otc" in name.lower()
+            ),
+            None
+        )
+
+        if not otc_asset:
+            available_otc = [
+                name for name in assets.keys()
+                if "otc" in name.lower()
+            ]
 
             return {
-                "status": "success",
+                "status": "connected",
                 "accountMode": "DEMO",
                 "tradingEnabled": False,
-                "asset": asset,
-                "assetStatus": str(asset_status),
-                "availableAssets": len(assets),
-                "candlePeriod": "1 minute",
-                "candleCount": len(candles or []),
-                "candles": candles or []
+                "message": "EUR/USD OTC not found",
+                "availableOTC": available_otc[:30]
             }
 
-        finally:
-            await client.close()
+        # Request 1-minute candles
+        candles = await client.get_candles(
+            otc_asset,
+            time.time(),
+            3600,
+            60
+        )
+
+        if not candles:
+            raise HTTPException(
+                status_code=502,
+                detail="Connected, but no candle data received"
+            )
+
+        return {
+            "status": "success",
+            "accountMode": "DEMO",
+            "tradingEnabled": False,
+            "asset": otc_asset,
+            "period": "1 minute",
+            "candleCount": len(candles),
+            "candles": candles
+        }
 
     except HTTPException:
         raise
@@ -111,5 +144,12 @@ async def test_otc_connection():
     except Exception as error:
         raise HTTPException(
             status_code=500,
-            detail=f"OTC data error: {str(error)}"
+            detail=f"Data connection error: {str(error)}"
         )
+
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
